@@ -30,7 +30,9 @@ import time
 from datetime import datetime
 
 import numpy as np
+import pandas as pd
 from catboost import CatBoostClassifier, Pool
+import xgboost as xgb
 
 from prepare import TIME_BUDGET, load_races, evaluate
 
@@ -58,6 +60,10 @@ RERANK_CAREER_TD_WIN_RATE_EDGE = 0.15
 # tracks/distances without paying the full validation cost globally.
 FS8_SPECIAL_TRACKS = {"ladbrokes-q1-lakeside", "the-gardens"}
 FS8_SPECIAL_DISTANCES = {390, 425}
+
+# A tiny XGBoost vote adds a small amount of complementary signal without
+# overwhelming the stronger CatBoost selector.
+XGB_BLEND_ALPHA = 0.01
 
 # ---------------------------------------------------------------------------
 # Feature extraction
@@ -359,6 +365,27 @@ def build_split_filtered(split, race_predicate):
     return X, y
 
 
+def build_xgb_split(split):
+    """Materialize a one-row-per-runner table for the XGBoost side model."""
+    rows, y = [], []
+    for race in load_races(split):
+        if MIN_TRAIN_DATE and split == "train" and race["date"] < MIN_TRAIN_DATE:
+            continue
+        feature_rows = race_feature_rows(race)
+        for runner, features in zip(race["runners"], feature_rows):
+            rows.append({k: features[k] for k in ALL_FEATURES})
+            y.append(1 if runner["box"] == race["winner_box"] else 0)
+    return rows, np.asarray(y, dtype=np.float32)
+
+
+def build_xgb_matrix(feature_rows, columns=None):
+    frame = pd.DataFrame([{k: row[k] for k in ALL_FEATURES} for row in feature_rows])
+    matrix = pd.get_dummies(frame, columns=CAT_FEATURES, dtype=np.float32)
+    if columns is not None:
+        matrix = matrix.reindex(columns=columns, fill_value=0.0)
+    return matrix.astype(np.float32)
+
+
 def rerank_close_calls(feature_rows, probs):
     if len(probs) < 2:
         return probs
@@ -409,6 +436,12 @@ def main():
     )
     print(f"  {len(X_train_fs8):,} rows, base rate = {sum(y_train_fs8)/len(y_train_fs8):.4f}")
 
+    print("Loading XGBoost blend split...")
+    X_train_xgb_rows, y_train_xgb = build_xgb_split("train")
+    X_train_xgb = build_xgb_matrix(X_train_xgb_rows)
+    xgb_columns = list(X_train_xgb.columns)
+    print(f"  {len(X_train_xgb):,} rows, base rate = {sum(y_train_xgb)/len(y_train_xgb):.4f}")
+
     print("Training CatBoost (all races)...")
     cat_idx = [ALL_FEATURES.index(c) for c in CAT_FEATURES]
     train_pool = Pool(X_train, y_train, cat_features=cat_idx)
@@ -441,6 +474,22 @@ def main():
         thread_count=-1,
     )
     model_fs8.fit(train_pool_fs8)
+
+    print("Training XGBoost blend model...")
+    xgb_model = xgb.XGBClassifier(
+        objective="binary:logistic",
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        tree_method="hist",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    xgb_model.fit(X_train_xgb, y_train_xgb)
     t_train = time.time() - t0
 
     # Build predict_fn for the fixed evaluator: scores are the model's P(win=1)
@@ -451,8 +500,13 @@ def main():
         rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
         active_model = model_fs8 if should_use_fs8_specialist(race) else model
-        probs = active_model.predict_proba(pool)[:, 1]
-        return rerank_close_calls(feature_rows, probs)
+        current_scores = rerank_close_calls(feature_rows, active_model.predict_proba(pool)[:, 1])
+        xgb_probs = xgb_model.predict_proba(build_xgb_matrix(feature_rows, xgb_columns))[:, 1]
+        blended_scores = [
+            ((1.0 - XGB_BLEND_ALPHA) * current_score) + (XGB_BLEND_ALPHA * xgb_score)
+            for current_score, xgb_score in zip(current_scores, xgb_probs)
+        ]
+        return rerank_close_calls(feature_rows, blended_scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")

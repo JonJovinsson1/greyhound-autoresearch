@@ -9,13 +9,13 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",
     "scikit-learn>=1.4",
+    "xgboost>=2.0",
 ]
 
 [project.optional-dependencies]
 # Extras the agent can opt into without bloating the base install.
 ranking = [
     "lightgbm>=4.3",
-    "xgboost>=2.0",
 ]
 deep = [
     "torch>=2.2",     # CPU build is fine on M2
