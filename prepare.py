@@ -1,389 +1,225 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Fixed data-layer + evaluation harness for greyhound autoresearch.
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+Imported by train.py. DO NOT MODIFY during experiments — this file defines the
+ground-truth metric and the data contract. If you change constants here, you
+break comparability with past runs.
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Metric philosophy (deliberate):
+- The goal is PURE top-1 win-rate accuracy. "Did the model's highest-probability
+  runner actually win this race?" — averaged over races.
+- Odds / starting price are NOT used. They are not features, not a target, and
+  not part of the metric. We intentionally do not expose `sp` on runners so the
+  agent cannot accidentally leak post-race information into a feature.
+- Log-loss on the true winner is reported as a secondary diagnostic, not the
+  objective.
+
+Exposes:
+    TRAIN_DIR, VAL_DIR, TEST_DIR   — data roots (historic vs pre-race layouts)
+    TIME_BUDGET                    — wall-clock training cap (seconds)
+    load_races(split)              — generator over normalized race dicts
+    evaluate(predict_fn, split)    — the fixed metric: top-1 accuracy + log-loss
 """
 
-import os
-import sys
-import time
+import json
 import math
-import argparse
-import pickle
-from multiprocessing import Pool
-
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import re
+from datetime import datetime
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+ROOT = Path(__file__).resolve().parent.parent
+TRAIN_DIR = ROOT / "train"     # 2025-10 … 2026-01, historic (race_info.results)
+VAL_DIR   = ROOT / "val"       # 2026-02, historic
+TEST_DIR  = ROOT / "test"      # 2026-03-17 … 2026-04-04, pre-race (temp_result.results)
+
+TIME_BUDGET = 300              # 5 min wall-clock training cap (honor this)
+MAX_BOX = 8                    # drop reserve boxes (>8)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Parsing helpers
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+def _parse_pos_1st(s):
+    """True if position string indicates a win ('1st' or '1st=')."""
+    return bool(s) and str(s).strip().startswith("1")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+def _parse_distance(gd):
+    m = re.search(r"(\d{3,4})\s*m", gd or "")
+    return int(m.group(1)) if m else None
+
 
 # ---------------------------------------------------------------------------
-# Data download
+# Race loading — handles both historic and pre-race JSON variants
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+def _normalize(raw, src_path):
+    """
+    Unify historic (race_info.results, meta.*) and pre-race (temp_result.results,
+    top-level track/date) formats into a single dict. Returns None if the race
+    can't be used (no results, no winner, too few runners).
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
+    We DELIBERATELY strip all odds/sp fields from the returned runner dicts so
+    they cannot be used as features. Odds are post-race info for historic data
+    and out-of-scope regardless.
+    """
+    # Meta can be nested under 'meta' (historic) or flat at top level (pre-race).
+    meta = raw.get("meta") or {}
+    track = meta.get("track") or raw.get("track") or ""
+    date  = meta.get("date")  or raw.get("date")  or ""
+    race_num = meta.get("race_number") or raw.get("race_num")
+
+    # Results live under race_info.results (historic) or temp_result.results (pre-race).
+    ri = raw.get("race_info") or {}
+    results = ri.get("results") or []
+    gd = ri.get("grade_distance") or raw.get("grade_distance") or ""
+    if not results:
+        tr = raw.get("temp_result") or {}
+        results = tr.get("results") or []
+    if not results:
+        return None
+
+    runners = raw.get("runners") or []
+    runners = [r for r in runners if isinstance(r.get("box"), int) and 1 <= r["box"] <= MAX_BOX]
+    if len(runners) < 2:
+        return None
+
+    # Winner by box.
+    winner_box = None
+    for r in results:
+        if _parse_pos_1st(r.get("position")) and isinstance(r.get("box"), int):
+            winner_box = r["box"]
+            break
+    if winner_box is None:
+        return None
+
+    # Strip odds from runners and their form history so they can't leak as features.
+    for r in runners:
+        r.pop("sp", None)
+        for fh in (r.get("form_history") or []):
+            fh.pop("sp", None)
+
+    try:
+        race_dt = datetime.strptime(date, "%Y-%m-%d")
+    except Exception:
+        race_dt = None
+
+    try:
+        race_num_int = int(race_num) if race_num is not None else None
+    except Exception:
+        race_num_int = None
+
+    return {
+        "race_id": src_path.stem,
+        "track": (track or "").lower().strip(),
+        "date": date,
+        "race_dt": race_dt,
+        "race_num": race_num_int,
+        "grade_distance": gd,
+        "distance": _parse_distance(gd),
+        "runners": runners,
+        "winner_box": winner_box,
+    }
+
+
+def _iter_json_files(root):
+    """Yield .json files under any subdirectory structure (train/YYYY-MM, test/YYYY-MM-DD)."""
+    if not root.is_dir():
+        return
+    for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+        for f in sorted(sub.glob("*.json")):
+            yield f
+
+
+def load_races(split):
+    """Generator of normalized race dicts for 'train' | 'val' | 'test'."""
+    root = {"train": TRAIN_DIR, "val": VAL_DIR, "test": TEST_DIR}[split]
+    for path in _iter_json_files(root):
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+            raw = json.loads(path.read_text())
+        except Exception:
+            continue
+        race = _normalize(raw, path)
+        if race is not None:
+            yield race
 
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Evaluation — THIS IS THE FIXED METRIC. Do not reinvent in train.py.
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def evaluate(predict_fn, split):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    predict_fn(race) -> list of scores, one per runner in race['runners'],
+                        in the same order. Higher score = more likely to win.
+                        Scores can be un-normalized; log-loss uses softmax-normalized
+                        probabilities over the field.
+
+    Primary metric (maximize): top1_accuracy — fraction of races where the
+    runner with the highest predicted score actually won.
+
+    Secondary (minimize): log_loss — mean negative log-likelihood of the true
+    winner under field-normalized probabilities. Useful as a tie-breaker and
+    for diagnosing over-confident-but-wrong models.
+
+    Ties in top-score are broken by picking the first runner with the max score.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    n_races = 0
+    n_top1 = 0
+    total_log_loss = 0.0
+    eps = 1e-9
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    for race in load_races(split):
+        runners = race["runners"]
+        scores = predict_fn(race)
+        if scores is None or len(scores) != len(runners):
+            raise ValueError(
+                f"predict_fn returned {None if scores is None else len(scores)} scores "
+                f"for {len(runners)} runners in race {race['race_id']}"
+            )
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+        scores = [float(s) for s in scores]
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+        # Top-1 pick (first argmax)
+        best_i = max(range(len(scores)), key=lambda i: scores[i])
+        if runners[best_i]["box"] == race["winner_box"]:
+            n_top1 += 1
 
-                remaining = row_capacity - pos
+        # Log-loss via softmax over the field (numerically stable)
+        m = max(scores)
+        exps = [math.exp(s - m) for s in scores]
+        z = sum(exps)
+        winner_p = eps
+        for r, e in zip(runners, exps):
+            if r["box"] == race["winner_box"]:
+                winner_p = max(e / z, eps)
+                break
+        total_log_loss += -math.log(winner_p)
+        n_races += 1
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    return {
+        "top1_accuracy": (n_top1 / n_races) if n_races else 0.0,
+        "log_loss": (total_log_loss / n_races) if n_races else float("inf"),
+        "n_races": n_races,
+        "n_top1": n_top1,
+    }
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
-
-# ---------------------------------------------------------------------------
-# Main
+# Quick health-check (run this file directly to verify data availability)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    for split, root in [("train", TRAIN_DIR), ("val", VAL_DIR), ("test", TEST_DIR)]:
+        if not root.is_dir():
+            print(f"{split:5s}: MISSING — {root}")
+            continue
+        n = sum(1 for _ in load_races(split))
+        print(f"{split:5s}: {n:>5d} usable races from {root}")
+    print(f"\nTIME_BUDGET = {TIME_BUDGET}s")
+    print("Metric: primary=top1_accuracy (higher=better), secondary=log_loss")
+    print("No odds / SP used anywhere.")

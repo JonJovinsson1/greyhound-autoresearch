@@ -1,114 +1,184 @@
-# autoresearch
+# greyhound-autoresearch — agent program
 
-This is an experiment to have the LLM do its own research.
+You are running an autonomous research loop on greyhound race prediction. This
+file is your persistent skill. Read it first every run.
 
-## Setup
+## Objective (read this twice)
 
-To set up a new experiment, work with the user to:
+Maximize **top-1 win-rate accuracy on `test/`** — fraction of races in
+`2026-03-17 … 2026-04-04` where the runner with your highest predicted score
+actually won. That is THE number.
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+- `train/` (2025-10 → 2026-01) fits the model.
+- `val/` (2026-02) selects hyperparameters / decides keep-vs-discard in the loop.
+- `test/` is the ultimate judge. Evaluate on it every run, report it, but don't
+  tune on it.
 
-Once you get confirmation, kick off the experimentation.
+**No odds. No SP. No ROI.** `prepare.py` already strips odds off runners. Do
+not add them back. Do not use `time` / `margin` / `winner` from the current
+race (only from prior runs in `form_history`). Any post-race leakage invalidates
+the run.
 
-## Experimentation
+## The two files
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+| File | Who edits | What's in it |
+|---|---|---|
+| `prepare.py` | nobody (frozen) | data loaders, `evaluate(predict_fn, split)`, the fixed metric |
+| `train.py` | **you** | features, model, training loop |
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+You may create scratch analysis files (e.g. `eda.py`, `scratch_*.py`), just
+don't commit them to the branch.
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+## Loop
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+```
+SETUP (once):
+  1. Agree on a run tag with the human (e.g. `apr5`).
+  2. git checkout -b autoresearch/<tag>
+  3. Read AGENT.md + this file + prepare.py + train.py.
+  4. Sanity check: `python prepare.py` — should list usable race counts for
+     train/val/test. If any split is 0 or missing, stop and tell the human.
+  5. Initialize `results.tsv` with the header:
+       commit\tval_top1\ttest_top1\tval_ll\ttest_ll\tsecs\tstatus\tnotes
+  6. Run the baseline as-is to lock in a reference row.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+LOOP FOREVER (after setup, do NOT stop to ask "should I keep going?"):
+  1. Form a single concrete hypothesis. Write it down (one sentence) in notes.
+  2. Edit train.py. git commit with a short message.
+  3. Run: `python train.py > run.log 2>&1`
+  4. Read results: `grep "^val_top1_accuracy:\|^test_top1_accuracy:\|^val_log_loss:\|^test_log_loss:\|^total_seconds:" run.log`
+  5. Append a row to results.tsv. Do NOT commit results.tsv (keep it untracked).
+  6. Keep/discard rule (primary = val_top1_accuracy):
+       - val_top1 strictly improves → keep commit, advance branch.
+       - val_top1 ties best → use val_log_loss as tiebreaker (lower wins).
+       - val_top1 worse → `git reset --hard HEAD~1`.
+  7. Push to remote so the human can see progress: `git push origin HEAD`.
+```
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+## Hard rules
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+- Time budget is 5 minutes wall-clock training (`TIME_BUDGET` in prepare.py).
+  If a run exceeds 10 min total, kill it and mark as `crash`. Do not widen the
+  budget to "win."
+- Never read from `test/` for hyperparameter selection. Only report its number.
+- Don't modify `prepare.py`. If you think the metric is wrong, stop and say so
+  to the human — do not silently change it.
+- Don't install new packages without a good reason. If you do add one, update
+  `pyproject.toml` and mention it in notes.
+- Don't touch `research/` — it's read-only prior art. You may read it for
+  ideas (there's years of CatBoost work in `research/catboostResearch/`).
 
-## Output format
+## EDA first, complexity second (this is important)
 
-Once the script finishes it prints a summary like this:
+The human explicitly asked for **data analysis over model complexity**. Before
+you stack more layers or swap models, answer questions like:
+
+- What's the base rate per box? Does box 1 actually win more than box 8?
+  What's the statistical significance? (Even box is signal.)
+- How does win rate vary by race_num? R1–R3 vs R10+ — is there a distribution
+  shift the model is missing?
+- How does win rate depend on field_size, distance, track?
+- Are there tracks where the baseline is strong and tracks where it collapses?
+  Look at per-track top-1 accuracy on val.
+- What fraction of winners come from dogs with 0 form_history entries?
+- Where does the model lose? Sample 50 races where the top-pick lost and eyeball them.
+
+When you find a real signal, it should show up as a cheap, interpretable
+feature that moves val_top1 by more than noise. A +0.2pp feature that adds
+3 lines is a keep. A +0.2pp trick that adds 100 lines is a discard.
+
+## Directions worth trying (start simple, get funky)
+
+**Simple (do these first):**
+- Within-race feature normalization (rank / z-score each feature across the
+  field, so the model sees relative-to-field, not absolute).
+- Softmax over the field at predict time with a learnable temperature, fit on val.
+- LightGBM / XGBoost ranker (`rank:pairwise`, groups = races) instead of a
+  binary classifier — this directly optimizes the per-race ordering, which is
+  what we're measured on.
+- Per-track or per-distance-bucket calibration (Platt / isotonic).
+- Dog-level features aggregated from ALL their historic form in train (career
+  win rate vs field, time z-score vs track/distance).
+
+**Medium:**
+- Elo / Glicko ratings updated game-by-game on train, frozen at val/test time.
+- Gradient-boosted ranker with monotone constraints (more recent-wins ↑,
+  worse avg_position ↓).
+- Ensemble CatBoost + LightGBM + Elo.
+- Target-encode categorical columns (track, grade, trainer, sire/dam) with
+  leave-one-fold-out to avoid leakage.
+- **Trainer metrics** — trainer win rate overall / at this track / at this
+  distance / over last 30 days, computed only from races strictly before
+  race_dt. Also pairwise: "this trainer's win rate vs the other trainers in
+  the field" (trainer-head-to-head). Same idea for sire / dam / kennel.
+
+**Funky (go here if the simple stuff plateaus):**
+- Per-dog sequence model over form_history: small transformer / GRU / Mamba-SSM
+  consuming (position, distance, time, first_split, margin, weight, days_ago)
+  per past run → dog embedding → race-level softmax. PyTorch-CPU on an M2 16GB
+  is fine for a tiny model.
+- Pretrained time-series foundation models (Chronos, TimesFM, Moirai) as
+  feature extractors over each dog's (time, first_split) sequence. Freeze the
+  backbone, just use the embedding. Treat this as a feature factory feeding
+  into the boosted model — it adds complexity, so it needs to pay for itself
+  in val_top1.
+- Learned race-level set-transformer over runner features (permutation-invariant
+  attention across the field, softmax over runners).
+- Contrastive dog embeddings: train an encoder s.t. the winner's embedding
+  scores higher than each loser's in the same race (pairwise hinge / InfoNCE).
+
+**Ambition ≠ progress.** Every addition must beat the baseline on val_top1
+or get reverted. Keep the winner, keep it simple, keep moving.
+
+## Re-rank / tiebreaker filters are fair game
+
+If the model's top-1 pick is often losing to a runner within ~0.3 probability
+of it, you're allowed to post-process the pick with a hand rule, as long as
+the rule only uses **pre-race** info (sex, age, weight, trainer, dog_id,
+career line, form_history, box, distance, grade, track, race_num, field_size —
+anything that would be knowable before the race is run).
+
+Example shapes:
+- "If the top-1 and top-2 are within 0.05 and top-2 is sex=D in a distance
+  ≥ 500m, swap them."
+- "If top-1 has 0 prior runs at this distance but top-2 has ≥3, swap them."
+- "If field_size ≥ 9 and top-1 is in box 8, demote to top-2."
+
+These rules compete against the ML model on a level playing field: they're
+kept only if they beat the current val_top1. They must not touch odds,
+results, time, margin, winner, or any field of the race being predicted.
+Grid-search small rule spaces on val, then check test.
+
+## Output contract
+
+`train.py` must end by printing (grep-able):
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+val_top1_accuracy:   <float>
+val_log_loss:        <float>
+val_races:           <int>
+test_top1_accuracy:  <float>
+test_log_loss:       <float>
+test_races:          <int>
+train_seconds:       <float>
+total_seconds:       <float>
+time_budget:         <int>
+num_train_rows:      <int>
+num_features:        <int>
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+If the run crashes, log `status=crash` in results.tsv with a one-line reason.
 
-```
-grep "^val_bpb:" run.log
-```
+## Platform note
 
-## Logging results
+Target machine is an M2 Mac, 16GB. Prefer CPU-friendly frameworks: CatBoost,
+LightGBM, XGBoost, scikit-learn, PyTorch-CPU with small models. Do not assume
+CUDA or MPS without checking. Small models, fast iterations, lots of EDA.
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+## NEVER STOP
 
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
-```
-
-## The experiment loop
-
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
-
-LOOP FOREVER:
-
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
-
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
-
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
-
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
-
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
-
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Once the loop has begun, don't pause to ask the human "should I continue?" or
+"is this a good place to stop?". If you run out of ideas, re-read EDA notes,
+look at failure cases, combine past near-misses, try a more radical direction
+from the list above. The loop runs until manually interrupted.

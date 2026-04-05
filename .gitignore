@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
 worktrees/
 results/
 queue/
@@ -18,6 +19,22 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+scratch_*.py
+eda_*.py
+notes_*.md
 
-# Results file
+# Experiment logs / artifacts
 results.tsv
+run.log
+*.log
+*.cbm
+*.bin
+*.pkl
+catboost_info/
+models/
+uv.lock
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
