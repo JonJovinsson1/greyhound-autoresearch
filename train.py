@@ -49,6 +49,11 @@ RANDOM_SEED    = 42
 MAX_FORM_RUNS  = 5       # how many recent form_history entries to consume per dog
 MIN_TRAIN_DATE = None    # e.g. "2025-10-01" to restrict train window; None = all
 
+# Close-call re-rank: only flip the top two picks when the model is nearly tied
+# and the runner-up owns a meaningfully stronger track+distance win history.
+RERANK_GAP_THRESHOLD = 0.05
+RERANK_CAREER_TD_WIN_RATE_EDGE = 0.15
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -79,6 +84,13 @@ def _parse_form_date(s):
         return datetime.strptime(s, "%d/%m/%Y")
     except Exception:
         return None
+
+
+def _parse_career_line(s):
+    m = re.match(r"(\d+):(\d+)-(\d+)-(\d+)", s or "")
+    if not m:
+        return 0, 0, 0, 0
+    return tuple(int(m.group(i)) for i in range(1, 5))
 
 
 def runner_features(runner, race):
@@ -155,12 +167,8 @@ def runner_features(runner, race):
     def _min(xs): return float(np.min(xs)) if xs else 0.0
 
     # Career line (e.g. "59:26-5-6" = starts:wins-2nds-3rds)
-    ca = runner.get("career_all") or ""
-    m = re.match(r"(\d+):(\d+)-(\d+)-(\d+)", ca)
-    if m:
-        c_starts, c_wins, c_2, c_3 = (int(m.group(i)) for i in range(1, 5))
-    else:
-        c_starts = c_wins = c_2 = c_3 = 0
+    c_starts, c_wins, c_2, c_3 = _parse_career_line(runner.get("career_all"))
+    td_c_starts, td_c_wins, _, _ = _parse_career_line(runner.get("career_td"))
 
     best_time = _parse_float(runner.get("best_time")) or 0.0
     best_split = _parse_float(runner.get("best_split")) or 0.0
@@ -206,6 +214,8 @@ def runner_features(runner, race):
         "career_starts": c_starts,
         "career_win_rate": (c_wins / c_starts) if c_starts else 0.0,
         "career_place_rate": ((c_wins + c_2 + c_3) / c_starts) if c_starts else 0.0,
+        "career_td_starts": td_c_starts,
+        "career_td_win_rate": (td_c_wins / td_c_starts) if td_c_starts else 0.0,
         "best_time": best_time,
         "best_split": best_split,
     }
@@ -329,6 +339,28 @@ def build_split(split):
     return X, y
 
 
+def rerank_close_calls(feature_rows, probs):
+    if len(probs) < 2:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = feature_rows[first_idx]
+    second = feature_rows[second_idx]
+    if first["career_td_starts"] <= 0 or second["career_td_starts"] <= 0:
+        return scores
+
+    td_edge = second["career_td_win_rate"] - first["career_td_win_rate"]
+    if td_edge >= RERANK_CAREER_TD_WIN_RATE_EDGE:
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 # ---------------------------------------------------------------------------
 # Train + evaluate
 # ---------------------------------------------------------------------------
@@ -366,7 +398,7 @@ def main():
         rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
         probs = model.predict_proba(pool)[:, 1]
-        return probs.tolist()
+        return rerank_close_calls(feature_rows, probs)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
