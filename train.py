@@ -165,6 +165,12 @@ def runner_features(runner, race):
         "race_num": race["race_num"] or 0,
         "distance": race_distance or 0,
         "field_size": len(race["runners"]),
+        # Availability
+        "has_form": 1 if n else 0,
+        "has_form_time": 1 if times else 0,
+        "has_form_first_split": 1 if first_splits else 0,
+        "has_best_time": 1 if best_time > 0 else 0,
+        "has_best_split": 1 if best_split > 0 else 0,
         # Recent form
         "form_runs": n,
         "form_win_rate": (wins / n) if n else 0.0,
@@ -189,14 +195,97 @@ def runner_features(runner, race):
     }
 
 
+RELATIVE_FEATURE_SPECS = [
+    ("box", "min", lambda f: False),
+    ("form_runs", "max", lambda f: False),
+    ("form_win_rate", "max", lambda f: False),
+    ("form_place_rate", "max", lambda f: False),
+    ("form_avg_pos", "min", lambda f: not f["has_form"]),
+    ("form_avg_time", "min", lambda f: not f["has_form_time"]),
+    ("form_best_time", "min", lambda f: not f["has_form_time"]),
+    ("form_avg_first_split", "min", lambda f: not f["has_form_first_split"]),
+    ("form_dist_runs", "max", lambda f: False),
+    ("form_dist_win_rate", "max", lambda f: False),
+    ("form_td_runs", "max", lambda f: False),
+    ("form_td_win_rate", "max", lambda f: False),
+    ("career_starts", "max", lambda f: False),
+    ("career_win_rate", "max", lambda f: False),
+    ("career_place_rate", "max", lambda f: False),
+    ("best_time", "min", lambda f: not f["has_best_time"]),
+    ("best_split", "min", lambda f: not f["has_best_split"]),
+]
+
+RELATIVE_NUMERIC_FEATURES = []
+for _name, _direction, _missing_fn in RELATIVE_FEATURE_SPECS:
+    RELATIVE_NUMERIC_FEATURES.extend([
+        f"{_name}_field_rank",
+        f"{_name}_field_gap",
+    ])
+
+
+def add_relative_features(feature_rows):
+    """Augment per-runner rows with within-race rank/gap features."""
+    n = len(feature_rows)
+    if not n:
+        return feature_rows
+
+    for name, direction, missing_fn in RELATIVE_FEATURE_SPECS:
+        scored = []
+        for idx, row in enumerate(feature_rows):
+            missing = missing_fn(row)
+            value = row[name]
+            if missing:
+                sort_value = math.inf if direction == "min" else -math.inf
+            else:
+                sort_value = value
+            scored.append((idx, sort_value, missing))
+
+        order = sorted(
+            scored,
+            key=lambda item: item[1],
+            reverse=(direction == "max"),
+        )
+        denom = max(n - 1, 1)
+        finite_values = [value for _, value, _ in scored if math.isfinite(value)]
+        if finite_values:
+            best = min(finite_values) if direction == "min" else max(finite_values)
+            worst = max(finite_values) if direction == "min" else min(finite_values)
+            span = abs(worst - best)
+        else:
+            best = 0.0
+            span = 0.0
+        span = max(span, 1e-9)
+
+        for rank, (idx, value, missing) in enumerate(order):
+            feature_rows[idx][f"{name}_field_rank"] = 1.0 - (rank / denom)
+            if missing or not math.isfinite(value):
+                feature_rows[idx][f"{name}_field_gap"] = 1.0
+            elif direction == "min":
+                feature_rows[idx][f"{name}_field_gap"] = (value - best) / span
+            else:
+                feature_rows[idx][f"{name}_field_gap"] = (best - value) / span
+
+    return feature_rows
+
+
+def race_feature_rows(race):
+    feature_rows = []
+    for runner in race["runners"]:
+        features = runner_features(runner, race)
+        features["track"] = race["track"] or "unknown"
+        feature_rows.append(features)
+    return add_relative_features(feature_rows)
+
+
 NUMERIC_FEATURES = [
     "box", "race_num", "distance", "field_size",
+    "has_form", "has_form_time", "has_form_first_split", "has_best_time", "has_best_split",
     "form_runs", "form_win_rate", "form_place_rate", "form_avg_pos",
     "form_avg_margin", "form_avg_time", "form_best_time", "form_avg_first_split",
     "form_days_since",
     "form_dist_runs", "form_dist_win_rate", "form_td_runs", "form_td_win_rate",
     "career_starts", "career_win_rate", "career_place_rate", "best_time", "best_split",
-]
+] + RELATIVE_NUMERIC_FEATURES
 CAT_FEATURES = ["track"]
 ALL_FEATURES = NUMERIC_FEATURES + CAT_FEATURES
 
@@ -207,11 +296,10 @@ def build_split(split):
     for race in load_races(split):
         if MIN_TRAIN_DATE and split == "train" and race["date"] < MIN_TRAIN_DATE:
             continue
-        for r in race["runners"]:
-            f = runner_features(r, race)
-            f["track"] = race["track"] or "unknown"
-            X.append([f[k] for k in ALL_FEATURES])
-            y.append(1 if r["box"] == race["winner_box"] else 0)
+        feature_rows = race_feature_rows(race)
+        for runner, features in zip(race["runners"], feature_rows):
+            X.append([features[k] for k in ALL_FEATURES])
+            y.append(1 if runner["box"] == race["winner_box"] else 0)
     return X, y
 
 
@@ -248,11 +336,8 @@ def main():
     # for each runner. evaluate() applies softmax over the field for log-loss and
     # takes the argmax for top-1. So using raw P(win=1) is fine.
     def predict_fn(race):
-        rows = []
-        for r in race["runners"]:
-            f = runner_features(r, race)
-            f["track"] = race["track"] or "unknown"
-            rows.append([f[k] for k in ALL_FEATURES])
+        feature_rows = race_feature_rows(race)
+        rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
         probs = model.predict_proba(pool)[:, 1]
         return probs.tolist()
