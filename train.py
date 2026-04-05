@@ -39,10 +39,10 @@ from prepare import TIME_BUDGET, load_races, evaluate
 # ---------------------------------------------------------------------------
 
 # Model
-ITERATIONS     = 600
-LEARNING_RATE  = 0.05
-DEPTH          = 6
-L2_LEAF_REG    = 3.0
+ITERATIONS     = 700
+LEARNING_RATE  = 0.04
+DEPTH          = 5
+L2_LEAF_REG    = 5.0
 RANDOM_SEED    = 42
 
 # Feature engineering
