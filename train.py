@@ -145,6 +145,12 @@ def runner_features(runner, race):
     else:
         days_since = -1
 
+    latest = valid[0][0] if valid else None
+    latest_pos, latest_field = _parse_pos(latest.get("position")) if latest else (None, None)
+    latest_margin = _parse_float(latest.get("margin")) if latest else None
+    latest_time = _parse_float(latest.get("time")) if latest else None
+    latest_first_split = _parse_float(latest.get("first_split")) if latest else None
+
     def _avg(xs): return float(np.mean(xs)) if xs else 0.0
     def _min(xs): return float(np.min(xs)) if xs else 0.0
 
@@ -169,10 +175,20 @@ def runner_features(runner, race):
         "has_form": 1 if n else 0,
         "has_form_time": 1 if times else 0,
         "has_form_first_split": 1 if first_splits else 0,
+        "has_last_pos": 1 if latest_pos is not None else 0,
+        "has_last_margin": 1 if latest_margin is not None else 0,
+        "has_last_time": 1 if latest_time is not None else 0,
+        "has_last_first_split": 1 if latest_first_split is not None else 0,
         "has_best_time": 1 if best_time > 0 else 0,
         "has_best_split": 1 if best_split > 0 else 0,
         # Recent form
         "form_runs": n,
+        "last_start_win": 1.0 if latest_pos == 1 else 0.0,
+        "last_start_pos": float(latest_pos) if latest_pos is not None else 0.0,
+        "last_start_pos_ratio": (latest_pos / latest_field) if latest_pos and latest_field else 0.0,
+        "last_start_margin": latest_margin if latest_margin is not None else 0.0,
+        "last_start_time": latest_time if latest_time is not None else 0.0,
+        "last_start_first_split": latest_first_split if latest_first_split is not None else 0.0,
         "form_win_rate": (wins / n) if n else 0.0,
         "form_place_rate": (places / n) if n else 0.0,
         "form_avg_pos": _avg(positions),
@@ -198,6 +214,12 @@ def runner_features(runner, race):
 RELATIVE_FEATURE_SPECS = [
     ("box", "min", lambda f: False),
     ("form_runs", "max", lambda f: False),
+    ("last_start_win", "max", lambda f: not f["has_last_pos"]),
+    ("last_start_pos", "min", lambda f: not f["has_last_pos"]),
+    ("last_start_pos_ratio", "min", lambda f: not f["has_last_pos"]),
+    ("last_start_margin", "min", lambda f: not f["has_last_margin"]),
+    ("last_start_time", "min", lambda f: not f["has_last_time"]),
+    ("last_start_first_split", "min", lambda f: not f["has_last_first_split"]),
     ("form_win_rate", "max", lambda f: False),
     ("form_place_rate", "max", lambda f: False),
     ("form_avg_pos", "min", lambda f: not f["has_form"]),
@@ -279,8 +301,12 @@ def race_feature_rows(race):
 
 NUMERIC_FEATURES = [
     "box", "race_num", "distance", "field_size",
-    "has_form", "has_form_time", "has_form_first_split", "has_best_time", "has_best_split",
-    "form_runs", "form_win_rate", "form_place_rate", "form_avg_pos",
+    "has_form", "has_form_time", "has_form_first_split",
+    "has_last_pos", "has_last_margin", "has_last_time", "has_last_first_split",
+    "has_best_time", "has_best_split",
+    "form_runs", "last_start_win", "last_start_pos", "last_start_pos_ratio",
+    "last_start_margin", "last_start_time", "last_start_first_split",
+    "form_win_rate", "form_place_rate", "form_avg_pos",
     "form_avg_margin", "form_avg_time", "form_best_time", "form_avg_first_split",
     "form_days_since",
     "form_dist_runs", "form_dist_win_rate", "form_td_runs", "form_td_win_rate",
