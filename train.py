@@ -54,6 +54,11 @@ MIN_TRAIN_DATE = None    # e.g. "2025-10-01" to restrict train window; None = al
 RERANK_GAP_THRESHOLD = 0.05
 RERANK_CAREER_TD_WIN_RATE_EDGE = 0.15
 
+# Field-size specialist: an 8-runner expert helps on a narrow subset of
+# tracks/distances without paying the full validation cost globally.
+FS8_SPECIAL_TRACKS = {"ladbrokes-q1-lakeside", "the-gardens"}
+FS8_SPECIAL_DISTANCES = {390, 425}
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -339,6 +344,21 @@ def build_split(split):
     return X, y
 
 
+def build_split_filtered(split, race_predicate):
+    """Variant of build_split that keeps only races matching a predicate."""
+    X, y = [], []
+    for race in load_races(split):
+        if MIN_TRAIN_DATE and split == "train" and race["date"] < MIN_TRAIN_DATE:
+            continue
+        if not race_predicate(race):
+            continue
+        feature_rows = race_feature_rows(race)
+        for runner, features in zip(race["runners"], feature_rows):
+            X.append([features[k] for k in ALL_FEATURES])
+            y.append(1 if runner["box"] == race["winner_box"] else 0)
+    return X, y
+
+
 def rerank_close_calls(feature_rows, probs):
     if len(probs) < 2:
         return probs
@@ -361,6 +381,16 @@ def rerank_close_calls(feature_rows, probs):
     return scores
 
 
+def should_use_fs8_specialist(race):
+    return (
+        len(race["runners"]) == 8
+        and (
+            race["track"] in FS8_SPECIAL_TRACKS
+            or race["distance"] in FS8_SPECIAL_DISTANCES
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Train + evaluate
 # ---------------------------------------------------------------------------
@@ -368,11 +398,18 @@ def rerank_close_calls(feature_rows, probs):
 def main():
     t0 = time.time()
 
-    print("Loading train split...")
+    print("Loading train split (all races)...")
     X_train, y_train = build_split("train")
     print(f"  {len(X_train):,} rows, base rate = {sum(y_train)/len(y_train):.4f}")
 
-    print("Training CatBoost...")
+    print("Loading 8-runner specialist split...")
+    X_train_fs8, y_train_fs8 = build_split_filtered(
+        "train",
+        lambda race: len(race["runners"]) == 8,
+    )
+    print(f"  {len(X_train_fs8):,} rows, base rate = {sum(y_train_fs8)/len(y_train_fs8):.4f}")
+
+    print("Training CatBoost (all races)...")
     cat_idx = [ALL_FEATURES.index(c) for c in CAT_FEATURES]
     train_pool = Pool(X_train, y_train, cat_features=cat_idx)
     model = CatBoostClassifier(
@@ -388,6 +425,22 @@ def main():
         thread_count=-1,
     )
     model.fit(train_pool)
+
+    print("Training CatBoost (8-runner specialist)...")
+    train_pool_fs8 = Pool(X_train_fs8, y_train_fs8, cat_features=cat_idx)
+    model_fs8 = CatBoostClassifier(
+        iterations=ITERATIONS,
+        learning_rate=LEARNING_RATE,
+        depth=DEPTH,
+        l2_leaf_reg=L2_LEAF_REG,
+        loss_function="Logloss",
+        eval_metric="Logloss",
+        random_seed=RANDOM_SEED,
+        verbose=100,
+        task_type="CPU",
+        thread_count=-1,
+    )
+    model_fs8.fit(train_pool_fs8)
     t_train = time.time() - t0
 
     # Build predict_fn for the fixed evaluator: scores are the model's P(win=1)
@@ -397,7 +450,8 @@ def main():
         feature_rows = race_feature_rows(race)
         rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
-        probs = model.predict_proba(pool)[:, 1]
+        active_model = model_fs8 if should_use_fs8_specialist(race) else model
+        probs = active_model.predict_proba(pool)[:, 1]
         return rerank_close_calls(feature_rows, probs)
 
     print("\nScoring val...")
