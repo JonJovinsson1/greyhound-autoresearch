@@ -87,6 +87,12 @@ FORM_TD_RERANK_GAP_THRESHOLD = 0.0075
 FORM_TD_RERANK_MIN_RUNS = 3
 FORM_TD_RERANK_WIN_RATE_EDGE = 0.25
 
+# Short-sprint best-time rerank: in the tightest sprint calls, give the nod to
+# the runner-up only when its published best time is meaningfully faster.
+BEST_TIME_RERANK_GAP_THRESHOLD = 0.005
+BEST_TIME_RERANK_MAX_DISTANCE = 320
+BEST_TIME_RERANK_EDGE = 0.08
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -606,6 +612,29 @@ def rerank_form_td_close_calls(feature_rows, probs):
     return scores
 
 
+def rerank_best_time_close_calls(race, feature_rows, probs):
+    if len(probs) < 2:
+        return probs
+    if not race["distance"] or race["distance"] > BEST_TIME_RERANK_MAX_DISTANCE:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > BEST_TIME_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = feature_rows[first_idx]
+    second = feature_rows[second_idx]
+    if not first["has_best_time"] or not second["has_best_time"]:
+        return scores
+
+    if (first["best_time"] - second["best_time"]) >= BEST_TIME_RERANK_EDGE:
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -709,7 +738,8 @@ def main():
         scores = rerank_close_calls(feature_rows, blended_scores)
         scores = rerank_entity_close_calls(entity_rows, scores)
         scores = rerank_money_close_calls(money_rows, scores)
-        return rerank_form_td_close_calls(feature_rows, scores)
+        scores = rerank_form_td_close_calls(feature_rows, scores)
+        return rerank_best_time_close_calls(race, feature_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
