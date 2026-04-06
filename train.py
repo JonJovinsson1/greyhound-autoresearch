@@ -110,6 +110,13 @@ RECENCY_SPLIT_RERANK_DAYS_EDGE = 7
 RECENCY_SPLIT_RERANK_LAST_SPLIT_EDGE = 0.01
 RECENCY_SPLIT_RERANK_AVG_SPLIT_EDGE = 0.01
 
+# Recency+class rerank: in very tight calls, a fresher dog with a meaningful
+# career win-rate edge can justify a small final swap.
+RECENCY_CLASS_RERANK_GAP_THRESHOLD = 0.006
+RECENCY_CLASS_RERANK_MIN_STARTS = 20
+RECENCY_CLASS_RERANK_DAYS_EDGE = 4
+RECENCY_CLASS_RERANK_WIN_RATE_EDGE = 0.06
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -716,6 +723,34 @@ def rerank_recency_split_close_calls(race, feature_rows, probs):
     return scores
 
 
+def rerank_recency_class_close_calls(feature_rows, probs):
+    if len(probs) < 2:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > RECENCY_CLASS_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = feature_rows[first_idx]
+    second = feature_rows[second_idx]
+    if min(first["career_starts"], second["career_starts"]) < RECENCY_CLASS_RERANK_MIN_STARTS:
+        return scores
+    if first["form_days_since"] < 0 or second["form_days_since"] < 0:
+        return scores
+
+    recency_edge = first["form_days_since"] - second["form_days_since"]
+    win_rate_edge = second["career_win_rate"] - first["career_win_rate"]
+    if (
+        recency_edge >= RECENCY_CLASS_RERANK_DAYS_EDGE
+        and win_rate_edge >= RECENCY_CLASS_RERANK_WIN_RATE_EDGE
+    ):
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -822,7 +857,8 @@ def main():
         scores = rerank_form_td_close_calls(feature_rows, scores)
         scores = rerank_best_time_close_calls(race, feature_rows, scores)
         scores = rerank_best_time_broad_close_calls(race, feature_rows, scores)
-        return rerank_recency_split_close_calls(race, feature_rows, scores)
+        scores = rerank_recency_split_close_calls(race, feature_rows, scores)
+        return rerank_recency_class_close_calls(feature_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
