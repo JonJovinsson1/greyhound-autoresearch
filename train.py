@@ -101,6 +101,15 @@ BEST_TIME_RERANK_BROAD_MAX_DISTANCE = 350
 BEST_TIME_RERANK_BROAD_EDGE = 0.10
 BEST_TIME_RERANK_BROAD_MIN_STARTS = 20
 
+# Recency+split rerank: in larger-field near ties, back the runner-up when it
+# is both materially fresher and at least a little sharper from the lids.
+RECENCY_SPLIT_RERANK_GAP_THRESHOLD = 0.0075
+RECENCY_SPLIT_RERANK_MIN_FIELD_SIZE = 7
+RECENCY_SPLIT_RERANK_MIN_FORM_RUNS = 3
+RECENCY_SPLIT_RERANK_DAYS_EDGE = 7
+RECENCY_SPLIT_RERANK_LAST_SPLIT_EDGE = 0.01
+RECENCY_SPLIT_RERANK_AVG_SPLIT_EDGE = 0.01
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -668,6 +677,45 @@ def rerank_best_time_broad_close_calls(race, feature_rows, probs):
     return scores
 
 
+def rerank_recency_split_close_calls(race, feature_rows, probs):
+    if len(probs) < 2:
+        return probs
+    if len(race["runners"]) < RECENCY_SPLIT_RERANK_MIN_FIELD_SIZE:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > RECENCY_SPLIT_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = feature_rows[first_idx]
+    second = feature_rows[second_idx]
+    if min(first["form_runs"], second["form_runs"]) < RECENCY_SPLIT_RERANK_MIN_FORM_RUNS:
+        return scores
+    if first["form_days_since"] < 0 or second["form_days_since"] < 0:
+        return scores
+
+    recency_edge = first["form_days_since"] - second["form_days_since"]
+    if recency_edge < RECENCY_SPLIT_RERANK_DAYS_EDGE:
+        return scores
+
+    last_split_ok = (
+        first["has_last_first_split"]
+        and second["has_last_first_split"]
+        and (first["last_start_first_split"] - second["last_start_first_split"]) >= RECENCY_SPLIT_RERANK_LAST_SPLIT_EDGE
+    )
+    avg_split_ok = (
+        first["has_form_first_split"]
+        and second["has_form_first_split"]
+        and (first["form_avg_first_split"] - second["form_avg_first_split"]) >= RECENCY_SPLIT_RERANK_AVG_SPLIT_EDGE
+    )
+    if last_split_ok or avg_split_ok:
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -773,7 +821,8 @@ def main():
         scores = rerank_money_close_calls(money_rows, scores)
         scores = rerank_form_td_close_calls(feature_rows, scores)
         scores = rerank_best_time_close_calls(race, feature_rows, scores)
-        return rerank_best_time_broad_close_calls(race, feature_rows, scores)
+        scores = rerank_best_time_broad_close_calls(race, feature_rows, scores)
+        return rerank_recency_split_close_calls(race, feature_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
