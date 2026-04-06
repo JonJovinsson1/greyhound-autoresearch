@@ -75,6 +75,12 @@ ENTITY_RERANK_DAM_EDGE = 0.04
 ENTITY_RERANK_SMOOTHING = 10.0
 ENTITY_RERANK_BASE_RATE = 0.14
 
+# Money rerank: in near ties, respect a big class edge only when both dogs have
+# enough history for prize-money-per-start to mean something.
+MONEY_RERANK_GAP_THRESHOLD = 0.005
+MONEY_RERANK_MIN_STARTS = 20
+MONEY_RERANK_RATIO = 1.4
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -83,7 +89,7 @@ def _parse_float(x):
     if x is None or x == "" or x == "—":
         return None
     try:
-        return float(str(x).replace("$", "").strip())
+        return float(str(x).replace("$", "").replace(",", "").strip())
     except Exception:
         return None
 
@@ -534,6 +540,45 @@ def rerank_entity_close_calls(entity_rows, probs):
     return scores
 
 
+def money_rerank_rows(race, feature_rows):
+    rows = []
+    for runner, features in zip(race["runners"], feature_rows):
+        prize_money = _parse_float(runner.get("prize_money"))
+        career_starts = features["career_starts"]
+        rows.append(
+            {
+                "career_starts": career_starts,
+                "money_per_start": (prize_money / career_starts) if prize_money is not None and career_starts > 0 else None,
+            }
+        )
+    return rows
+
+
+def rerank_money_close_calls(money_rows, probs):
+    if len(probs) < 2:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > MONEY_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = money_rows[first_idx]
+    second = money_rows[second_idx]
+    if min(first["career_starts"], second["career_starts"]) < MONEY_RERANK_MIN_STARTS:
+        return scores
+    if first["money_per_start"] is None or second["money_per_start"] is None:
+        return scores
+    if first["money_per_start"] <= 0:
+        return scores
+
+    if (second["money_per_start"] / first["money_per_start"]) >= MONEY_RERANK_RATIO:
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -624,6 +669,7 @@ def main():
     def predict_fn(race):
         feature_rows = race_feature_rows(race)
         entity_rows = get_entity_prior_rows(race)
+        money_rows = money_rerank_rows(race, feature_rows)
         rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
         active_model = model_fs8 if should_use_fs8_specialist(race) else model
@@ -634,7 +680,8 @@ def main():
             for current_score, xgb_score in zip(current_scores, xgb_probs)
         ]
         scores = rerank_close_calls(feature_rows, blended_scores)
-        return rerank_entity_close_calls(entity_rows, scores)
+        scores = rerank_entity_close_calls(entity_rows, scores)
+        return rerank_money_close_calls(money_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
