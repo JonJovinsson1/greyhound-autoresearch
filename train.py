@@ -27,6 +27,7 @@ Usage: python train.py
 import math
 import re
 import time
+from collections import defaultdict
 from datetime import datetime
 
 import numpy as np
@@ -65,6 +66,15 @@ FS8_SPECIAL_DISTANCES = {390, 425}
 # overwhelming the stronger CatBoost selector.
 XGB_BLEND_ALPHA = 0.01
 
+# Entity rerank: in very tight calls, swap to the runner-up only when both the
+# trainer and dam priors point the same way with enough sample behind them.
+ENTITY_RERANK_GAP_THRESHOLD = 0.005
+ENTITY_RERANK_MIN_STARTS = 20
+ENTITY_RERANK_TRAINER_EDGE = 0.02
+ENTITY_RERANK_DAM_EDGE = 0.04
+ENTITY_RERANK_SMOOTHING = 10.0
+ENTITY_RERANK_BASE_RATE = 0.14
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -102,6 +112,91 @@ def _parse_career_line(s):
     if not m:
         return 0, 0, 0, 0
     return tuple(int(m.group(i)) for i in range(1, 5))
+
+
+def _normalize_text(s):
+    return (s or "").strip().lower()
+
+
+ENTITY_PRIOR_CACHE = None
+
+
+def _race_cache_key(race):
+    return (
+        race["race_id"],
+        race["date"],
+        race["track"],
+        race["race_num"],
+        len(race["runners"]),
+    )
+
+
+def _smoothed_win_rate(starts, wins):
+    return (wins + (ENTITY_RERANK_SMOOTHING * ENTITY_RERANK_BASE_RATE)) / (starts + ENTITY_RERANK_SMOOTHING)
+
+
+def build_entity_prior_cache():
+    """Compute trainer/dam priors from races strictly earlier than each race date."""
+    races = []
+    for split in ["train", "val", "test"]:
+        for race in load_races(split):
+            races.append((race["date"], race["race_num"] or 0, race["race_id"], race))
+    races.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    trainer_stats = defaultdict(lambda: [0, 0])
+    dam_stats = defaultdict(lambda: [0, 0])
+    cache = {}
+    pending_races = []
+    active_date = None
+
+    def flush_pending():
+        nonlocal pending_races
+        for pending_race in pending_races:
+            for runner in pending_race["runners"]:
+                won = runner["box"] == pending_race["winner_box"]
+                trainer_key = _normalize_text(runner.get("trainer"))
+                if trainer_key:
+                    trainer_stats[trainer_key][0] += 1
+                    trainer_stats[trainer_key][1] += int(won)
+                dam_key = _normalize_text(runner.get("dam"))
+                if dam_key:
+                    dam_stats[dam_key][0] += 1
+                    dam_stats[dam_key][1] += int(won)
+        pending_races = []
+
+    for date_key, _, _, race in races:
+        if active_date is None:
+            active_date = date_key
+        elif date_key != active_date:
+            flush_pending()
+            active_date = date_key
+
+        prior_rows = []
+        for runner in race["runners"]:
+            trainer_key = _normalize_text(runner.get("trainer"))
+            trainer_starts, trainer_wins = trainer_stats[trainer_key] if trainer_key else (0, 0)
+            dam_key = _normalize_text(runner.get("dam"))
+            dam_starts, dam_wins = dam_stats[dam_key] if dam_key else (0, 0)
+            prior_rows.append(
+                {
+                    "trainer_starts": trainer_starts,
+                    "trainer_win_rate": _smoothed_win_rate(trainer_starts, trainer_wins),
+                    "dam_starts": dam_starts,
+                    "dam_win_rate": _smoothed_win_rate(dam_starts, dam_wins),
+                }
+            )
+        cache[_race_cache_key(race)] = prior_rows
+        pending_races.append(race)
+
+    flush_pending()
+    return cache
+
+
+def get_entity_prior_rows(race):
+    global ENTITY_PRIOR_CACHE
+    if ENTITY_PRIOR_CACHE is None:
+        ENTITY_PRIOR_CACHE = build_entity_prior_cache()
+    return ENTITY_PRIOR_CACHE.get(_race_cache_key(race), [{} for _ in race["runners"]])
 
 
 def runner_features(runner, race):
@@ -408,6 +503,37 @@ def rerank_close_calls(feature_rows, probs):
     return scores
 
 
+def rerank_entity_close_calls(entity_rows, probs):
+    if len(probs) < 2:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > ENTITY_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = entity_rows[first_idx]
+    second = entity_rows[second_idx]
+    if (
+        first.get("trainer_starts", 0) < ENTITY_RERANK_MIN_STARTS
+        or second.get("trainer_starts", 0) < ENTITY_RERANK_MIN_STARTS
+        or first.get("dam_starts", 0) < ENTITY_RERANK_MIN_STARTS
+        or second.get("dam_starts", 0) < ENTITY_RERANK_MIN_STARTS
+    ):
+        return scores
+
+    trainer_edge = second["trainer_win_rate"] - first["trainer_win_rate"]
+    dam_edge = second["dam_win_rate"] - first["dam_win_rate"]
+    if (
+        trainer_edge >= ENTITY_RERANK_TRAINER_EDGE
+        and dam_edge >= ENTITY_RERANK_DAM_EDGE
+    ):
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -497,6 +623,7 @@ def main():
     # takes the argmax for top-1. So using raw P(win=1) is fine.
     def predict_fn(race):
         feature_rows = race_feature_rows(race)
+        entity_rows = get_entity_prior_rows(race)
         rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
         pool = Pool(rows, cat_features=cat_idx)
         active_model = model_fs8 if should_use_fs8_specialist(race) else model
@@ -506,7 +633,8 @@ def main():
             ((1.0 - XGB_BLEND_ALPHA) * current_score) + (XGB_BLEND_ALPHA * xgb_score)
             for current_score, xgb_score in zip(current_scores, xgb_probs)
         ]
-        return rerank_close_calls(feature_rows, blended_scores)
+        scores = rerank_close_calls(feature_rows, blended_scores)
+        return rerank_entity_close_calls(entity_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
