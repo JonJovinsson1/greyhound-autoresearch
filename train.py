@@ -81,6 +81,12 @@ MONEY_RERANK_GAP_THRESHOLD = 0.005
 MONEY_RERANK_MIN_STARTS = 20
 MONEY_RERANK_RATIO = 1.4
 
+# Recent track+distance rerank: in tight calls, recent local specialization can
+# beat the blended model when both dogs have enough same-course evidence.
+FORM_TD_RERANK_GAP_THRESHOLD = 0.0075
+FORM_TD_RERANK_MIN_RUNS = 3
+FORM_TD_RERANK_WIN_RATE_EDGE = 0.25
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -579,6 +585,27 @@ def rerank_money_close_calls(money_rows, probs):
     return scores
 
 
+def rerank_form_td_close_calls(feature_rows, probs):
+    if len(probs) < 2:
+        return probs
+
+    scores = probs.tolist() if hasattr(probs, "tolist") else list(probs)
+    order = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+    first_idx, second_idx = order[:2]
+    gap = scores[first_idx] - scores[second_idx]
+    if gap > FORM_TD_RERANK_GAP_THRESHOLD:
+        return scores
+
+    first = feature_rows[first_idx]
+    second = feature_rows[second_idx]
+    if min(first["form_td_runs"], second["form_td_runs"]) < FORM_TD_RERANK_MIN_RUNS:
+        return scores
+
+    if (second["form_td_win_rate"] - first["form_td_win_rate"]) >= FORM_TD_RERANK_WIN_RATE_EDGE:
+        scores[first_idx], scores[second_idx] = scores[second_idx], scores[first_idx]
+    return scores
+
+
 def should_use_fs8_specialist(race):
     return (
         len(race["runners"]) == 8
@@ -681,7 +708,8 @@ def main():
         ]
         scores = rerank_close_calls(feature_rows, blended_scores)
         scores = rerank_entity_close_calls(entity_rows, scores)
-        return rerank_money_close_calls(money_rows, scores)
+        scores = rerank_money_close_calls(money_rows, scores)
+        return rerank_form_td_close_calls(feature_rows, scores)
 
     print("\nScoring val...")
     val = evaluate(predict_fn, "val")
