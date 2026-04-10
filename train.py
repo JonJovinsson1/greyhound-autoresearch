@@ -24,6 +24,7 @@ reaching for bigger models. Simpler wins are more valuable than complex ones.
 Usage: python train.py
 """
 
+import argparse
 import math
 import re
 import time
@@ -36,6 +37,7 @@ from catboost import CatBoostClassifier, Pool
 import xgboost as xgb
 
 from prepare import TIME_BUDGET, load_races, evaluate
+from inverse_bottom3.experiment import train_bottom3_side_model, score_race_bottom3
 
 # ---------------------------------------------------------------------------
 # Hyperparameters — edit these directly
@@ -65,6 +67,19 @@ FS8_SPECIAL_DISTANCES = {390, 425}
 # A tiny XGBoost vote adds a small amount of complementary signal without
 # overwhelming the stronger CatBoost selector.
 XGB_BLEND_ALPHA = 0.01
+# XGBoost's OpenMP worker startup has been intermittently crashing on this
+# macOS setup, so keep its trainer single-threaded for stability.
+XGB_N_JOBS = 1
+
+# Bottom-3 side model: train a separate CatBoost to identify runners likely to
+# finish in the bottom 3, then use it as a conservative penalty on the winner
+# stack rather than a replacement signal.
+BOTTOM3_SIDE_GROUPS = ("relative", "specialization", "race_context")
+BOTTOM3_ITERATIONS = 100
+BOTTOM3_LEARNING_RATE = 0.05
+BOTTOM3_DEPTH = 5
+BOTTOM3_L2_LEAF_REG = 5.0
+BOTTOM3_ALPHA_GRID = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25]
 
 # Entity rerank: in very tight calls, swap to the runner-up only when both the
 # trainer and dam priors point the same way with enough sample behind them.
@@ -158,6 +173,12 @@ def _parse_career_line(s):
 
 def _normalize_text(s):
     return (s or "").strip().lower()
+
+
+def _same_track(history_track, race_track):
+    ht = _normalize_text(history_track)
+    rt = _normalize_text(race_track)
+    return bool(ht and rt and ht.startswith(rt[:4]))
 
 
 ENTITY_PRIOR_CACHE = None
@@ -294,7 +315,7 @@ def runner_features(runner, race):
             dist_runs += 1
             if p == 1:
                 dist_wins += 1
-            if ht and race_track and ht.startswith(race_track[:4]):
+            if _same_track(ht, race_track):
                 td_runs += 1
                 if p == 1:
                     td_wins += 1
@@ -761,11 +782,31 @@ def should_use_fs8_specialist(race):
     )
 
 
+def apply_bottom3_penalty(scores, bottom3_probs, alpha):
+    if alpha <= 0.0:
+        return list(scores)
+    adjusted = []
+    for score, risk in zip(scores, bottom3_probs):
+        adjusted.append(float(score) * (1.0 - (alpha * float(risk))))
+    return adjusted
+
+
 # ---------------------------------------------------------------------------
 # Train + evaluate
 # ---------------------------------------------------------------------------
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--skip-bottom3-side-model",
+        action="store_true",
+        help="Disable the CatBoost bottom-3 side model.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     t0 = time.time()
 
     print("Loading train split (all races)...")
@@ -829,39 +870,87 @@ def main():
         reg_lambda=1.0,
         tree_method="hist",
         random_state=RANDOM_SEED,
-        n_jobs=-1,
+        n_jobs=XGB_N_JOBS,
         verbosity=0,
     )
     xgb_model.fit(X_train_xgb, y_train_xgb)
+
+    bottom3_bundle = None
+    if args.skip_bottom3_side_model:
+        print("Skipping CatBoost bottom-3 side model.")
+    else:
+        print("Training CatBoost bottom-3 side model...")
+        bottom3_bundle = train_bottom3_side_model(
+            groups=BOTTOM3_SIDE_GROUPS,
+            split="train",
+            iterations=BOTTOM3_ITERATIONS,
+            learning_rate=BOTTOM3_LEARNING_RATE,
+            depth=BOTTOM3_DEPTH,
+            l2_leaf_reg=BOTTOM3_L2_LEAF_REG,
+            random_seed=RANDOM_SEED,
+        )
+        print(
+            f"  {bottom3_bundle['train_rows']:,} rows, groups={','.join(bottom3_bundle['groups'])}, "
+            f"features={len(bottom3_bundle['feature_names'])}"
+        )
     t_train = time.time() - t0
 
     # Build predict_fn for the fixed evaluator: scores are the model's P(win=1)
     # for each runner. evaluate() applies softmax over the field for log-loss and
     # takes the argmax for top-1. So using raw P(win=1) is fine.
-    def predict_fn(race):
-        feature_rows = race_feature_rows(race)
-        entity_rows = get_entity_prior_rows(race)
-        money_rows = money_rerank_rows(race, feature_rows)
-        rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
-        pool = Pool(rows, cat_features=cat_idx)
-        active_model = model_fs8 if should_use_fs8_specialist(race) else model
-        current_scores = rerank_close_calls(feature_rows, active_model.predict_proba(pool)[:, 1])
-        xgb_probs = xgb_model.predict_proba(build_xgb_matrix(feature_rows, xgb_columns))[:, 1]
-        blended_scores = [
-            ((1.0 - XGB_BLEND_ALPHA) * current_score) + (XGB_BLEND_ALPHA * xgb_score)
-            for current_score, xgb_score in zip(current_scores, xgb_probs)
-        ]
-        scores = rerank_close_calls(feature_rows, blended_scores)
-        scores = rerank_entity_close_calls(entity_rows, scores)
-        scores = rerank_money_close_calls(money_rows, scores)
-        scores = rerank_form_td_close_calls(feature_rows, scores)
-        scores = rerank_best_time_close_calls(race, feature_rows, scores)
-        scores = rerank_best_time_broad_close_calls(race, feature_rows, scores)
-        scores = rerank_recency_split_close_calls(race, feature_rows, scores)
-        return rerank_recency_class_close_calls(feature_rows, scores)
+    def make_predict_fn(bottom3_alpha):
+        def predict_fn(race):
+            feature_rows = race_feature_rows(race)
+            entity_rows = get_entity_prior_rows(race)
+            money_rows = money_rerank_rows(race, feature_rows)
+            rows = [[features[k] for k in ALL_FEATURES] for features in feature_rows]
+            pool = Pool(rows, cat_features=cat_idx)
+            active_model = model_fs8 if should_use_fs8_specialist(race) else model
+            current_scores = rerank_close_calls(feature_rows, active_model.predict_proba(pool)[:, 1])
+            xgb_probs = xgb_model.predict_proba(build_xgb_matrix(feature_rows, xgb_columns))[:, 1]
+            blended_scores = [
+                ((1.0 - XGB_BLEND_ALPHA) * current_score) + (XGB_BLEND_ALPHA * xgb_score)
+                for current_score, xgb_score in zip(current_scores, xgb_probs)
+            ]
+            if bottom3_bundle is not None:
+                bottom3_probs, _ = score_race_bottom3(race, bottom3_bundle)
+                blended_scores = apply_bottom3_penalty(blended_scores, bottom3_probs, bottom3_alpha)
+            scores = rerank_close_calls(feature_rows, blended_scores)
+            scores = rerank_entity_close_calls(entity_rows, scores)
+            scores = rerank_money_close_calls(money_rows, scores)
+            scores = rerank_form_td_close_calls(feature_rows, scores)
+            scores = rerank_best_time_close_calls(race, feature_rows, scores)
+            scores = rerank_best_time_broad_close_calls(race, feature_rows, scores)
+            scores = rerank_recency_split_close_calls(race, feature_rows, scores)
+            return rerank_recency_class_close_calls(feature_rows, scores)
+        return predict_fn
 
-    print("\nScoring val...")
-    val = evaluate(predict_fn, "val")
+    alpha_grid = BOTTOM3_ALPHA_GRID if bottom3_bundle is not None else [0.0]
+    print("\nSearching val for bottom-3 penalty alpha...")
+    best_alpha = alpha_grid[0]
+    best_val = None
+    for alpha in alpha_grid:
+        candidate_val = evaluate(make_predict_fn(alpha), "val")
+        print(
+            f"  alpha={alpha:.2f}: val_top1={candidate_val['top1_accuracy']:.6f} "
+            f"val_log_loss={candidate_val['log_loss']:.6f}"
+        )
+        if best_val is None:
+            best_alpha = alpha
+            best_val = candidate_val
+            continue
+        if (
+            candidate_val["top1_accuracy"] > best_val["top1_accuracy"]
+            or (
+                candidate_val["top1_accuracy"] == best_val["top1_accuracy"]
+                and candidate_val["log_loss"] < best_val["log_loss"]
+            )
+        ):
+            best_alpha = alpha
+            best_val = candidate_val
+
+    predict_fn = make_predict_fn(best_alpha)
+    val = best_val
     print("Scoring test...")
     test = evaluate(predict_fn, "test")
 
@@ -880,6 +969,8 @@ def main():
     print(f"time_budget:         {TIME_BUDGET}")
     print(f"num_train_rows:      {len(X_train)}")
     print(f"num_features:        {len(ALL_FEATURES)}")
+    print(f"bottom3_alpha:       {best_alpha:.2f}")
+    print(f"bottom3_groups:      {','.join(bottom3_bundle['groups']) if bottom3_bundle else 'none'}")
 
 
 if __name__ == "__main__":
